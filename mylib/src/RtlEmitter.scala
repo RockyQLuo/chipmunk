@@ -93,7 +93,7 @@ object SpiToAxiLiteEmitter extends App {
     "--disable-all-randomization",
     "--strip-debug-info",
     "-repl-seq-mem",
-    s"-repl-seq-mem-file=$targetDir/seq-mem.conf"
+    "-repl-seq-mem-file=seq-mem.conf"
   )
 
   ChiselStage.emitSystemVerilogFile(new SpiToAxiLiteTop, chiselArgs, firtoolOpts)
