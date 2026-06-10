@@ -223,12 +223,13 @@ class SpiDebugger(
   uSpiRegFile.io.access.rd.rsp.ready     := true.B
 
   val regRdData = uSpiRegFile.io.access.rd.rsp.bits.data
+  val busWrQueueOverflow = WireDefault(false.B)
 
   uSpiRegFile.io.fields("BUS_RD_DATA").backdoorUpdate.get.valid := io.mDbg.rd.rsp.fire
   uSpiRegFile.io.fields("BUS_RD_DATA").backdoorUpdate.get.bits  := io.mDbg.rd.rsp.bits.data
 
-  uSpiRegFile.io.fields("BUS_WR_RESP").backdoorUpdate.get.valid := io.mDbg.wr.rsp.fire
-  uSpiRegFile.io.fields("BUS_WR_RESP").backdoorUpdate.get.bits  := io.mDbg.wr.rsp.bits.error.asUInt
+  uSpiRegFile.io.fields("BUS_WR_RESP").backdoorUpdate.get.valid := io.mDbg.wr.rsp.fire || busWrQueueOverflow
+  uSpiRegFile.io.fields("BUS_WR_RESP").backdoorUpdate.get.bits  := Mux(busWrQueueOverflow, true.B, io.mDbg.wr.rsp.bits.error).asUInt
 
   uSpiRegFile.io.fields("BUS_RD_RESP").backdoorUpdate.get.valid := io.mDbg.rd.rsp.fire
   uSpiRegFile.io.fields("BUS_RD_RESP").backdoorUpdate.get.bits  := io.mDbg.rd.rsp.bits.error.asUInt
@@ -244,20 +245,52 @@ class SpiDebugger(
   // ---------------------------------------------------------------------------
   // Bus access
 
-  // It does NOT check whether the previous request is finished before issuing a new request.
-  // If a new request is issued before the previous one is finished, it may cause some unexpected behavior. To avoid
-  // this, users should ensure that the SPI clock frequency is much slower than the on-chip bus access.
-
   val busWrReqFast = spiStateCurr === SpiState.BUS_WR_DATA && spiStateNext === SpiState.IDLE
   val busRdReqFast = spiStateCurr === SpiState.BUS_ADDR && spiStateNext === SpiState.BUS_RD_DUMMY
   val busWrReqNorm = uSpiRegFile.io.fields("BUS_WR_RESP").isBeingWritten
   val busRdReqNorm = uSpiRegFile.io.fields("BUS_RD_RESP").isBeingWritten
 
-  val busWrReqValid: Bool = RegInit(false.B)
-  when(busWrReqFast || busWrReqNorm) {
-    busWrReqValid := true.B
-  }.elsewhen(io.mDbg.wr.cmd.fire) {
-    busWrReqValid := false.B
+  val busReqAddr = Wire(UInt(busAddrWidth.W))
+  if (busAddrWidth > 32) {
+    busReqAddr := (uSpiRegFile.io.fields("BUS_ADDR_H").value ## uSpiRegFile.io.fields("BUS_ADDR_L").value)(
+      busAddrWidth - 1,
+      0
+    )
+  } else {
+    busReqAddr := uSpiRegFile.io.fields("BUS_ADDR_L").value
+  }
+
+  val busWrQueueDepth = 8
+  val busWrQueueAddr  = Reg(Vec(busWrQueueDepth, UInt(busAddrWidth.W)))
+  val busWrQueueData  = Reg(Vec(busWrQueueDepth, UInt(32.W)))
+  val busWrQueueMask  = Reg(Vec(busWrQueueDepth, UInt(io.mDbg.strobeWidth.W)))
+  val busWrQueueEnq   = RegInit(0.U(log2Ceil(busWrQueueDepth).W))
+  val busWrQueueDeq   = RegInit(0.U(log2Ceil(busWrQueueDepth).W))
+  val busWrQueueCount = RegInit(0.U(log2Ceil(busWrQueueDepth + 1).W))
+
+  def busWrQueuePtrNext(ptr: UInt): UInt = Mux(ptr === (busWrQueueDepth - 1).U, 0.U, ptr + 1.U)
+
+  val busWrQueueValid = busWrQueueCount =/= 0.U
+  val busWrQueuePop   = busWrQueueValid && io.mDbg.wr.cmd.ready
+  val busWrQueueFull  = busWrQueueCount === busWrQueueDepth.U
+  val busWrQueuePush  = (busWrReqFast || busWrReqNorm) && (!busWrQueueFull || busWrQueuePop)
+  busWrQueueOverflow := (busWrReqFast || busWrReqNorm) && busWrQueueFull && !busWrQueuePop
+
+  when(busWrQueuePush) {
+    busWrQueueAddr(busWrQueueEnq) := busReqAddr
+    busWrQueueData(busWrQueueEnq) := Mux(busWrReqFast, spiRxData, uSpiRegFile.io.fields("BUS_WR_DATA").value)
+    busWrQueueMask(busWrQueueEnq) := uSpiRegFile.io.fields("BUS_WR_MASK").value
+    busWrQueueEnq := busWrQueuePtrNext(busWrQueueEnq)
+  }
+
+  when(busWrQueuePop) {
+    busWrQueueDeq := busWrQueuePtrNext(busWrQueueDeq)
+  }
+
+  when(busWrQueuePush && !busWrQueuePop) {
+    busWrQueueCount := busWrQueueCount + 1.U
+  }.elsewhen(!busWrQueuePush && busWrQueuePop) {
+    busWrQueueCount := busWrQueueCount - 1.U
   }
 
   val buRdReqValid: Bool = RegInit(false.B)
@@ -267,19 +300,13 @@ class SpiDebugger(
     buRdReqValid := false.B
   }
 
-  io.mDbg.wr.cmd.valid := busWrReqValid
+  io.mDbg.wr.cmd.valid := busWrQueueValid
   io.mDbg.rd.cmd.valid := buRdReqValid
 
-  io.mDbg.wr.cmd.bits.data   := uSpiRegFile.io.fields("BUS_WR_DATA").value
-  io.mDbg.wr.cmd.bits.strobe := uSpiRegFile.io.fields("BUS_WR_MASK").value
-
-  if (busAddrWidth > 32) {
-    io.mDbg.wr.cmd.bits.addr := uSpiRegFile.io.fields("BUS_ADDR_H").value ## uSpiRegFile.io.fields("BUS_ADDR_L").value
-    io.mDbg.rd.cmd.bits.addr := uSpiRegFile.io.fields("BUS_ADDR_H").value ## uSpiRegFile.io.fields("BUS_ADDR_L").value
-  } else {
-    io.mDbg.wr.cmd.bits.addr := uSpiRegFile.io.fields("BUS_ADDR_L").value
-    io.mDbg.rd.cmd.bits.addr := uSpiRegFile.io.fields("BUS_ADDR_L").value
-  }
+  io.mDbg.wr.cmd.bits.addr   := busWrQueueAddr(busWrQueueDeq)
+  io.mDbg.wr.cmd.bits.data   := busWrQueueData(busWrQueueDeq)
+  io.mDbg.wr.cmd.bits.strobe := busWrQueueMask(busWrQueueDeq)
+  io.mDbg.rd.cmd.bits.addr   := busReqAddr
 
   io.mDbg.wr.rsp.ready := true.B
   io.mDbg.rd.rsp.ready := true.B
